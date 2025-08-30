@@ -27,10 +27,12 @@ export class PaymentSessionItemDto {
   @IsString()
   name: string;
 
+  @Type(() => Number)
   @IsNumber()
   @IsPositive()
   price: number;
 
+  @Type(() => Number)
   @IsNumber()
   @IsPositive()
   quantity: number;
