@@ -4,6 +4,7 @@ import Stripe from 'stripe';
 import { PaymentSessionDto } from './dto/payment-session.dto';
 import { Request, Response } from 'express';
 import { ClientProxy } from '@nestjs/microservices';
+import { lastValueFrom } from 'rxjs';
 
 @Injectable()
 export class PaymentsService {
@@ -53,43 +54,95 @@ export class PaymentsService {
       url: session.url,
     }
   }
+  
 
   async stripeWebhook(req: Request, res: Response) {
-    const sig = req.headers['stripe-signature'];
-
-    let event: Stripe.Event;
-
-    // Real
-    const endpointSecret = envs.stripeEndpointSecret;
-
-    try {
-      event = this.stripe.webhooks.constructEvent(
-        req['rawBody'],
-        sig,
-        endpointSecret,
-      );
-    } catch (err) {
-      res.status(400).send(`Webhook Error: ${err.message}`);
-      return;
-    }
-    
-    switch( event.type ) {
-      case 'charge.succeeded': 
-        const chargeSucceeded = event.data.object;
-        const payload = {
-          stripePaymentId: chargeSucceeded.id,
-          orderId: chargeSucceeded.metadata.orderId,
-          receiptUrl: chargeSucceeded.receipt_url,
-        }
-
-        // this.logger.log({ payload });
-        this.client.emit('payment.succeeded', payload );
-      break;
-      
-      default:
-        console.log(`Event ${ event.type } not handled`);
-    }
-
-    return res.status(200).json({ sig });
+  const sig = req.headers['stripe-signature'] as string | undefined;
+  if (!sig) {
+    this.logger.error('Missing stripe-signature header');
+    return res.status(400).send('Missing stripe-signature header');
   }
+
+  const endpointSecret = envs.stripeEndpointSecret;
+  if (!endpointSecret) {
+    this.logger.error('Missing STRIPE_ENDPOINT_SECRET env var');
+    return res.status(500).send('Server misconfiguration');
+  }
+  this.logger.log(`Stripe whsec loaded (...${endpointSecret.slice(-6)})`);
+
+  let event: Stripe.Event;
+  try {
+    event = this.stripe.webhooks.constructEvent(
+      req.body,
+      //req['rawBody'],   // requiere app.use('/payments/webhook', raw({ type: 'application/json' }))
+      sig,
+      endpointSecret,
+    );
+  } catch (err: any) {
+    this.logger.error(`Webhook signature verification failed: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`); // 👈 IMPORTANTE
+  }
+
+  this.logger.log(`Webhook OK: ${event.type}`);
+
+  switch (event.type) {
+ 
+    //Desde aqui
+case 'charge.succeeded': {
+  const ch = event.data.object as Stripe.Charge;
+
+  let orderId   = ch.metadata?.orderId as string | undefined;
+  let receiptUrl = ch.receipt_url as string | undefined;
+
+  // Si no vino en el charge, recupéralo desde el Payment Intent
+  if ((!orderId || !receiptUrl) && typeof ch.payment_intent === 'string') {
+    // Trae el PI expandiendo latest_charge (no uses pi.charges)
+    const piResp = await this.stripe.paymentIntents.retrieve(
+      ch.payment_intent,
+      { expand: ['latest_charge'] }
+    );
+
+    const pi = piResp as unknown as Stripe.PaymentIntent;
+
+    // orderId desde metadata del PI (si faltaba)
+    if (!orderId) orderId = pi.metadata?.orderId;
+
+    // recibo desde latest_charge
+    if (!receiptUrl) {
+      if (typeof pi.latest_charge !== 'string' && pi.latest_charge) {
+        receiptUrl = (pi.latest_charge as Stripe.Charge).receipt_url ?? undefined;
+      } else if (typeof pi.latest_charge === 'string') {
+        const latestCharge = await this.stripe.charges.retrieve(pi.latest_charge);
+        receiptUrl = latestCharge.receipt_url ?? undefined;
+      }
+    }
+  }
+
+  if (!orderId) {
+    this.logger.warn(`charge.succeeded sin orderId; no emito. charge=${ch.id}`);
+    return res.status(200).json({ ok: true });
+  }
+
+  const payload = {
+    stripePaymentId: ch.id,
+    orderId,
+    receiptUrl: receiptUrl ?? null,
+  };
+
+  this.logger.log(`Payload a emitir: ${JSON.stringify(payload)}`);
+  await lastValueFrom(this.client.emit('payment.succeeded', payload));
+  this.logger.log('Evento payment.succeeded emitido correctamente');
+  break;
+
+    // Hasta aqui
+      
+    }
+    default:
+      this.logger.warn(`Event ${event.type} not handled`);
+  }
+
+  return res.status(200).json({ ok: true });
+}
+
+
 }

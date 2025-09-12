@@ -3,6 +3,7 @@ import { Logger, ValidationPipe } from '@nestjs/common';
 import { AppModule } from './app.module';
 import { envs } from './config';
 import { MicroserviceOptions, Transport } from '@nestjs/microservices';
+import { raw } from 'express';
 
 async function bootstrap() {
   const logger = new Logger('Payments-ms');
@@ -10,6 +11,8 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     rawBody: true
   });
+
+  app.use('/payments/webhook', raw({ type: 'application/json' }));
 
   app.useGlobalPipes(
     new ValidationPipe({
